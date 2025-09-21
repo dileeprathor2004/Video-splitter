@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Video Shortener — Split long videos into 30–60s clips</title>
+  <style>
+    body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Arial; margin: 20px; }
+    .card { border: 1px solid #ddd; padding: 16px; border-radius: 10px; max-width: 900px; margin: 12px auto; box-shadow: 0 6px 18px rgba(0,0,0,0.03); }
+    input[type=file] { display:block; margin-bottom: 12px; }
+    label { display:block; margin-bottom:6px; font-weight:600 }
+    button { padding: 8px 12px; border-radius:8px; border: none; background:#2563eb; color:white; cursor:pointer }
+    button[disabled] { opacity:.5; cursor:default }
+    .progress { width:100%; background:#f3f3f3; height:10px; border-radius:6px; overflow:hidden; margin-top:8px }
+    .bar { height:10px; width:0%; background:#10b981 }
+    .segments { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px }
+    .seg { padding:8px; border:1px solid #eee; border-radius:8px; min-width:160px }
+    small { color:#555 }
+    a.inline { margin-left:8px; font-size:90% }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Video Shortener — Split long videos into 30–60s clips (browser)</h2>
+    <p>Choose a video (mp4/webm/ogg). The app will split it into sequential clips of the length you choose (30–60 seconds). Works entirely in your browser using <code>ffmpeg.wasm</code>. No upload to any server.</p>
+
+    <label for="file">1) Select video file</label>
+    <input id="file" type="file" accept="video/*">
+
+    <label for="length">2) Clip length (seconds) — choose between 30 and 60</label>
+    <input id="length" type="range" min="30" max="60" value="30"> <span id="lenVal">30</span>s
+
+    <div style="margin-top:10px">
+      <button id="startBtn" disabled>Load FFmpeg & Split</button>
+      <button id="cancelBtn" style="margin-left:8px" disabled>Cancel</button>
+      <a class="inline" href="https://github.com/your-username/video-shortener" target="_blank" rel="noopener">Fork on GitHub</a>
+    </div>
+
+    <div id="status" style="margin-top:12px"></div>
+    <div class="progress" aria-hidden>
+      <div class="bar" id="bar"></div>
+    </div>
+
+    <div id="segments" class="segments"></div>
+
+    <hr>
+    <small>Notes: For very large files this can be memory-heavy. If your browser runs out of memory, try trimming or working with shorter input files or use a native app. Tested in Chrome/Edge. FFmpeg.wasm is loaded from CDN.</small>
+  </div>
+
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script>
+  // Video splitter using FFmpeg.wasm
+  const { createFFmpeg, fetchFile } = FFmpeg;
+  const ffmpeg = createFFmpeg({ log: true });
+
+  const fileInput = document.getElementById('file');
+  const lenRange = document.getElementById('length');
+  const lenVal = document.getElementById('lenVal');
+  const startBtn = document.getElementById('startBtn');
+  const cancelBtn = document.getElementById('cancelBtn');
+  const status = document.getElementById('status');
+  const bar = document.getElementById('bar');
+  const segmentsDiv = document.getElementById('segments');
+
+  let abort = false;
+  let inputFileName = '';
+  let inputFileExt = '';
+
+  lenRange.addEventListener('input', ()=> lenVal.textContent = lenRange.value);
+
+  fileInput.addEventListener('change', ()=>{
+    if (fileInput.files.length) {
+      startBtn.disabled = false;
+      const f = fileInput.files[0];
+      const nameParts = f.name.split('.');
+      inputFileExt = nameParts.length>1 ? nameParts.pop() : 'mp4';
+      inputFileName = 'input.' + inputFileExt;
+      status.innerText = `Selected: ${f.name} — ${Math.round(f.size/1024/1024)} MB`;
+    } else {
+      startBtn.disabled = true;
+    }
+  });
+
+  startBtn.addEventListener('click', async ()=>{
+    if (!fileInput.files.length) return alert('Please select a video file');
+    abort = false;
+    startBtn.disabled = true;
+    cancelBtn.disabled = false;
+    segmentsDiv.innerHTML = '';
+
+    try {
+      // load ffmpeg if not already
+      if (!ffmpeg.isLoaded()){
+        status.innerText = 'Loading FFmpeg (this may take a few seconds)...';
+        await ffmpeg.load();
+      }
+
+      const file = fileInput.files[0];
+      status.innerText = 'Writing file to virtual FS...';
+      updateProgress(10);
+      await ffmpeg.FS('writeFile', inputFileName, await fetchFile(file));
+      updateProgress(20);
+
+      // estimate duration using HTML video element
+      let duration = await estimateDurationWithVideoElement(file);
+
+      status.innerText = `Input duration: ${formatTime(duration)}.`;
+      updateProgress(30);
+
+      const clipLen = Number(lenRange.value);
+      const clips = Math.ceil(duration / clipLen);
+      status.innerText = `Splitting into ${clips} clip(s) of ${clipLen}s (last clip may be shorter)...`;
+
+      for (let i=0;i<clips;i++){
+        if (abort) throw new Error('Cancelled by user');
+        const start = i * clipLen;
+        const outName = `clip_${i+1}.${inputFileExt}`;
+        status.innerText = `Creating clip ${i+1}/${clips} (start ${formatTime(start)})...`;
+        updateProgress(30 + Math.round((i/clips) * 60));
+
+        // Try stream copy first (fast). If it fails, fall back to re-encode
+        try{
+          await ffmpeg.run('-ss', `${start}`, '-t', `${clipLen}`, '-i', inputFileName, '-c', 'copy', outName);
+        } catch (err) {
+          console.warn('Stream copy failed, falling back to encode for clip', i+1, err);
+          await ffmpeg.run('-ss', `${start}`, '-t', `${clipLen}`, '-i', inputFileName, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', outName);
+        }
+
+        // Pull file from FS and create download link
+        const data = ffmpeg.FS('readFile', outName);
+        const blob = new Blob([data.buffer], { type: `video/${inputFileExt}` });
+        const url = URL.createObjectURL(blob);
+
+        const segEl = document.createElement('div'); segEl.className='seg';
+        segEl.innerHTML = `<strong>Clip ${i+1}</strong><br><video controls width=220 src="${url}"></video><br><a download="${outName}" href="${url}">Download</a>`;
+        segmentsDiv.appendChild(segEl);
+
+        // free output file from ffmpeg FS to save memory
+        try{ ffmpeg.FS('unlink', outName); } catch(e){ }
+      }
+
+      updateProgress(100);
+      status.innerText = 'Done — download clips above.';
+
+    } catch (err) {
+      console.error(err);
+      status.innerText = `Error: ${err.message || err}`;
+    } finally {
+      startBtn.disabled = false;
+      cancelBtn.disabled = true;
+    }
+  });
+
+  cancelBtn.addEventListener('click', ()=>{ abort = true; status.innerText = 'Cancelling...'; cancelBtn.disabled = true; });
+
+  function updateProgress(p){ bar.style.width = Math.min(100, Math.max(0, p)) + '%'; }
+
+  function formatTime(s){
+    s = Math.floor(s);
+    const hh = Math.floor(s/3600); const mm = Math.floor((s%3600)/60); const ss = s%60;
+    return (hh? hh+':':'') + String(mm).padStart(2,'0') + ':' + String(ss).padStart(2,'0');
+  }
+
+  async function estimateDurationWithVideoElement(file){
+    return await new Promise((resolve)=>{
+      const v = document.createElement('video');
+      v.preload = 'metadata';
+      v.src = URL.createObjectURL(file);
+      v.onloadedmetadata = ()=>{ const d = v.duration || 0; URL.revokeObjectURL(v.src); resolve(Math.ceil(d)); };
+      v.onerror = ()=>{ resolve(0); };
+    });
+  }
+
+</script>
+</body>
+</html>
